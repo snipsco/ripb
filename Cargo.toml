@@ -1,0 +1,6 @@
+[package]
+name = "ripb"
+version = "0.1.0"
+authors = ["Thibaut Lorrain <fredszaq@gmail.com>"]
+
+[dependencies]

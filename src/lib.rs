@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Sender, Receiver, channel};
 use std::thread;
 
 use boxfnonce::SendBoxFnOnce;
@@ -21,42 +21,24 @@ struct InnerBus {
 
 pub struct Subscriber {
     inner: Arc<InnerSubscriber>,
-    inner_bus: Arc<Mutex<InnerBus>>,
 }
 
 enum SubscriberTask {
-    Stop,
-    Run { callback: SendBoxFnOnce<()> },
+    Run {
+        type_id: TypeId,
+        payload: Box<Any + Send>,
+        // fn (callback, payload)
+        callback: SendBoxFnOnce<(Arc<Box<Any>>, Box<Any>)>,
+    },
+    RegisterCallback {
+        type_id: TypeId,
+        callback: Box<Any + Send>,
+    },
 }
 
 struct InnerSubscriber {
-    callbacks: HashMap<TypeId, Box<Any>>,
     id: u32,
     tx: Sender<SubscriberTask>,
-}
-
-impl InnerSubscriber {
-    fn new(id: u32) -> Self {
-        let (tx, rx) = channel();
-
-       /* thread::spawn(move || {
-            loop {
-                match rx.recv() {
-                    Ok(SubscriberTask::Run { callback }) => callback.call(),
-                    Ok(SubscriberTask::Stop) => break,
-                    Err(e) => {
-                        panic!("why did that happen? ");
-                    }
-                }
-            }
-        });*/
-
-        Self {
-            callbacks: HashMap::new(),
-            id,
-            tx,
-        }
-    }
 }
 
 impl Eq for InnerSubscriber {}
@@ -101,14 +83,13 @@ impl Bus {
         let mut current_id = self.current_id.lock().unwrap(); // TODO error handling
 
         let inner = Arc::new(InnerSubscriber::new(*current_id));
-        let inner_bus = Arc::clone(&self.inner);
 
         let mut unlocked_bus = self.inner.lock().unwrap(); // TODO error handling
         unlocked_bus.subscribers.insert(Arc::clone(&inner));
 
         *current_id = *current_id + 1;
 
-        Subscriber { inner, inner_bus }
+        Subscriber { inner }
     }
 
     pub fn publish<M: Send + Sync + 'static>(&self, message: M) {
@@ -123,6 +104,10 @@ impl Bus {
 
 impl Subscriber {
     pub fn on_message<F, M>(&mut self, callback: F) where F: Fn(&M) + Send + 'static, M: Send + Sync + 'static {
+        self.inner.on_message(Callback::new(callback))
+
+
+        /*
         let mut unlocked_bus = self.inner_bus.lock().unwrap(); // TODO error handling
 
         // The arc count of the inner sub is 2 (one in the bus set and one in self.inner) in order
@@ -149,27 +134,55 @@ impl Subscriber {
         });
 
         // Add back the inner sub to the bus set, arc count = 2
-        unlocked_bus.subscribers.insert(Arc::clone(&self.inner));
+        unlocked_bus.subscribers.insert(Arc::clone(&self.inner));*/
     }
 }
 
+
 impl InnerSubscriber {
-    pub fn on_message<M: Send + Sync + 'static>(&mut self, callback: Callback<M>) {
-        self.callbacks.insert(TypeId::of::<M>(), Box::new(callback));
+    fn new(id: u32) -> Self {
+        let (tx, rx) = channel();
+        let result = Self {
+            id,
+            tx,
+        };
+        result.start(rx);
+        result
+    }
+
+
+    fn start(&self, rx: Receiver<SubscriberTask>) {
+        thread::spawn(move || {
+            let mut callbacks: HashMap<TypeId, Arc<Box<Any>>> = HashMap::new();
+            loop {
+                match rx.recv() {
+                    Ok(SubscriberTask::RegisterCallback { type_id, callback }) => {
+                        callbacks.insert(type_id, Arc::new(callback));
+                    }
+                    Ok(SubscriberTask::Run { type_id, payload, callback }) => {
+                        callbacks.get(&type_id).map(|it| callback.call_tuple((Arc::clone(it), payload)));
+                    }
+                    Err(_) => { /* sender is dead */break; }
+                }
+            }
+        });
+    }
+
+    pub fn on_message<M: Send + Sync + 'static>(&self, callback: Callback<M>) {
+        self.tx.send(SubscriberTask::RegisterCallback { callback: Box::new(callback), type_id: TypeId::of::<M>() }).unwrap()
     }
 
     fn receive<M: Send + Sync + 'static>(&self, message: Arc<M>) {
-        self.callbacks.get(&TypeId::of::<M>()).map(|any| {
-            let callback = any.downcast_ref::<Callback<M>>();
-            if let Some(ref callback) = callback {
-                //let callback = Arc::clone(callback);
-                //self.tx.send(SubscriberTask::Run { callback: SendBoxFnOnce::new(|| callback.call(&*message)) });
-                callback.call(&*message);
-            } else {
-                unreachable!()
+        self.tx.send(SubscriberTask::Run {
+            type_id: TypeId::of::<M>(),
+            payload: Box::new(message),
+            callback: SendBoxFnOnce::new(|c: Arc<Box<Any>>, payload: Box<Any>| {
+                let callback = c.downcast_ref::<Callback<M>>().unwrap();
+                let message = payload.downcast_ref::<Arc<M>>().unwrap();
+                callback.call(message);
             }
-        }
-        );
+            ),
+        }).unwrap() // TODO error handling
     }
 }
 
@@ -179,6 +192,7 @@ mod tests {
     use super::*;
     use std::sync::mpsc::channel;
     use std::time::Duration;
+    use std::thread;
 
     #[test]
     fn can_send_a_simple_message_to_a_subscriber() {

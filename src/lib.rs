@@ -181,7 +181,7 @@ impl Subscriber {
 
     /// Register a new callback to be called each time a message of the given type is published on
     /// the bus
-    pub fn on_message<F, M>(&mut self, callback: F) where F: Fn(&M) + Send + 'static, M: Message + 'static {
+    pub fn on_message<F, M>(&self, callback: F) where F: Fn(&M) + Send + 'static, M: Message + 'static {
 
         // TODO remove this unwrap
         self.tx.send(SubscriberTask::RegisterCallback {
@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn can_send_a_simple_message_to_a_subscriber() {
         let bus = Bus::new();
-        let mut subscriber = bus.create_subscriber();
+        let subscriber = bus.create_subscriber();
 
         let (tx, rx) = channel();
 
@@ -217,8 +217,8 @@ mod tests {
     #[test]
     fn can_send_a_simple_message_to_2_subscriber2() {
         let bus = Bus::new();
-        let mut subscriber = bus.create_subscriber();
-        let mut subscriber2 = bus.create_subscriber();
+        let subscriber = bus.create_subscriber();
+        let subscriber2 = bus.create_subscriber();
 
         let (tx, rx) = channel();
         let (tx2, rx2) = channel();
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn can_send_a_complex_message_to_a_subscriber() {
         let bus = Bus::new();
-        let mut subscriber = bus.create_subscriber();
+        let subscriber = bus.create_subscriber();
 
         let (tx, rx) = channel();
 
@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn can_send_simple_messages_to_a_subscriber_from_multiple_threads() {
         let bus = Bus::new();
-        let mut subscriber = bus.create_subscriber();
+        let subscriber = bus.create_subscriber();
 
         let (tx, rx) = channel();
 
@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn can_send_simple_messages_to_a_subscriber_from_cloned_instance() {
         let bus = Bus::new();
-        let mut subscriber = bus.create_subscriber();
+        let subscriber = bus.create_subscriber();
 
         let (tx, rx) = channel();
 

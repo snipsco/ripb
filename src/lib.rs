@@ -1,34 +1,33 @@
-extern crate boxfnonce;
-
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, HashSet};
-use std::fmt::{Debug, Formatter};
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::mpsc::{Sender, Receiver, channel};
 use std::thread;
 
-use boxfnonce::SendBoxFnOnce;
-
+#[derive(Clone)]
 pub struct Bus {
-    inner: Arc<Mutex<InnerBus>>,
-    current_id: Mutex<u32>,
+    tx: Sender<BusTask>,
 }
 
-struct InnerBus {
-    subscribers: HashSet<Arc<InnerSubscriber>>
+enum BusTask {
+    Publish {
+        type_id: TypeId,
+        message: Box<Any + Send>,
+        cloner: Cloner,
+        worker: Worker,
+    },
+    RegisterSubscriber { subscriber: Sender<SubscriberTask> },
 }
 
 pub struct Subscriber {
-    inner: Arc<InnerSubscriber>,
+    tx: Sender<SubscriberTask>
 }
 
 enum SubscriberTask {
-    Run {
+    Receive {
         type_id: TypeId,
-        payload: Box<Any + Send>,
-        // fn (callback, payload)
-        callback: SendBoxFnOnce<(Arc<Box<Any>>, Box<Any>)>,
+        message: Box<Any + Send>,
+        worker: Arc<Worker>,
     },
     RegisterCallback {
         type_id: TypeId,
@@ -36,32 +35,46 @@ enum SubscriberTask {
     },
 }
 
-struct InnerSubscriber {
-    id: u32,
-    tx: Sender<SubscriberTask>,
+struct Cloner {
+    callback: Box<Fn(&Box<Any + Send>) -> (Box<Any + Send>) + Send>
 }
 
-impl Eq for InnerSubscriber {}
+impl Cloner {
+    pub fn of<T: Send + Sync + 'static>() -> Self {
+        Self {
+            // TODO error handler remove this unwrap
+            callback: Box::new(|payload| Box::new(Arc::clone(payload.downcast_ref::<Arc<T>>().unwrap())) as Box<Any + Send>)
+        }
+    }
 
-impl PartialEq for InnerSubscriber {
-    fn eq(&self, other: &InnerSubscriber) -> bool {
-        self.id == other.id
+    pub fn call(&self, to_clone: &Box<Any + Send>) -> Box<Any + Send> {
+        (self.callback)(to_clone)
     }
 }
 
-impl Hash for InnerSubscriber {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state)
+struct Worker {
+    // fn (callback, payload)
+    worker: Box<Fn(Arc<Box<Any>>, Box<Any>) + Send + Sync>
+}
+
+impl Worker {
+    pub fn of<T: Send + Sync + 'static>() -> Self {
+        Self {
+            worker: Box::new(|c: Arc<Box<Any>>, payload: Box<Any>| {
+                let callback = c.downcast_ref::<Callback<T>>().unwrap();
+                let message = payload.downcast_ref::<Arc<T>>().unwrap();
+                callback.call(message);
+            })
+        }
+    }
+
+
+    pub fn call(&self, callback: Arc<Box<Any>>, payload: Box<Any>) {
+        (self.worker)(callback, payload)
     }
 }
 
-impl Debug for InnerSubscriber {
-    fn fmt(&self, f: &mut Formatter) -> ::std::fmt::Result {
-        write!(f, "InnerSubscriber[ id: {} ]", self.id)
-    }
-}
-
-pub struct Callback<M: Send + Sync + 'static> {
+struct Callback<M: Send + Sync + 'static> {
     callback: Box<Fn(&M) -> () + Send>
 }
 
@@ -76,74 +89,53 @@ impl<M: Send + Sync + 'static> Callback<M> {
 
 impl Bus {
     pub fn new() -> Self {
-        Self { inner: Arc::new(Mutex::new(InnerBus { subscribers: HashSet::new() })), current_id: Mutex::new(0) }
+        let (tx, rx) = channel();
+
+        thread::spawn(move || {
+            let mut subscribers: Vec<Sender<SubscriberTask>> = vec![];
+            loop {
+                match rx.recv() {
+                    Ok(BusTask::Publish { type_id, message, cloner, worker }) => {
+                        let callback = Arc::new(worker);
+                        for subscriber in subscribers.iter() {
+                            subscriber.send(SubscriberTask::Receive {
+                                type_id,
+                                message: cloner.call(&message),
+                                worker: Arc::clone(&callback),
+                            }).unwrap() // TODO what should we do if this fails ? remove the subscriber ?
+                        }
+                    }
+                    Ok(BusTask::RegisterSubscriber { subscriber }) => subscribers.push(subscriber),
+                    /* senders are dead */
+                    Err(_) => break,
+                }
+            }
+        }
+        );
+
+        Self { tx }
     }
 
     pub fn create_subscriber(&self) -> Subscriber {
-        let mut current_id = self.current_id.lock().unwrap(); // TODO error handling
-
-        let inner = Arc::new(InnerSubscriber::new(*current_id));
-
-        let mut unlocked_bus = self.inner.lock().unwrap(); // TODO error handling
-        unlocked_bus.subscribers.insert(Arc::clone(&inner));
-
-        *current_id = *current_id + 1;
-
-        Subscriber { inner }
+        let subscriber = Subscriber::new();
+        self.tx.send(BusTask::RegisterSubscriber { subscriber: subscriber.tx.clone() }).unwrap(); // TODO error handling
+        subscriber
     }
 
     pub fn publish<M: Send + Sync + 'static>(&self, message: M) {
-        let arc = Arc::new(message);
-
-        //TODO error handling remove this unwrap()
-        for sub in &self.inner.lock().unwrap().subscribers {
-            sub.receive(Arc::clone(&arc));
-        }
+        self.tx.send(BusTask::Publish {
+            type_id: TypeId::of::<M>(),
+            message: Box::new(Arc::new(message)),
+            cloner: Cloner::of::<M>(),
+            worker: Worker::of::<M>(),
+        }).unwrap(); //TODO error handling remove this unwrap()
     }
 }
 
 impl Subscriber {
-    pub fn on_message<F, M>(&mut self, callback: F) where F: Fn(&M) + Send + 'static, M: Send + Sync + 'static {
-        self.inner.on_message(Callback::new(callback))
-
-
-        /*
-        let mut unlocked_bus = self.inner_bus.lock().unwrap(); // TODO error handling
-
-        // The arc count of the inner sub is 2 (one in the bus set and one in self.inner) in order
-        // to modify the inner sub, we must return this to one in order to be able to unwrap the
-        // arc. We've got a mutable borrow of self and just got a lock on the bus, we're all set for
-        // some arc black magic, with no unsafe, please :D
-
-        // remove the inner sub from the bus set, arc count = 1
-        unlocked_bus.subscribers.remove(&self.inner);
-
-        // clone the inner sub arc, arc count = 2
-        let sub = Arc::clone(&self.inner);
-
-        // replace the inner sub arc by a another one, arc count = 1
-        // TODO find a way not to create this subscriber ? this creates a hashmap and spawns a thread...
-        self.inner = Arc::new(InnerSubscriber::new(0));
-
-        // now, the arc count is 1, so we can try_unwrap
-        // TODO error handling remove unwrap
-        self.inner = Arc::new({
-            let mut sub = Arc::try_unwrap(sub).unwrap();
-            sub.on_message(Callback::new(callback));
-            sub
-        });
-
-        // Add back the inner sub to the bus set, arc count = 2
-        unlocked_bus.subscribers.insert(Arc::clone(&self.inner));*/
-    }
-}
-
-
-impl InnerSubscriber {
-    fn new(id: u32) -> Self {
+    fn new() -> Self {
         let (tx, rx) = channel();
         let result = Self {
-            id,
             tx,
         };
         result.start(rx);
@@ -159,30 +151,23 @@ impl InnerSubscriber {
                     Ok(SubscriberTask::RegisterCallback { type_id, callback }) => {
                         callbacks.insert(type_id, Arc::new(callback));
                     }
-                    Ok(SubscriberTask::Run { type_id, payload, callback }) => {
-                        callbacks.get(&type_id).map(|it| callback.call_tuple((Arc::clone(it), payload)));
+                    Ok(SubscriberTask::Receive { type_id, message, worker }) => {
+                        callbacks.get(&type_id).map(|it| worker.call(Arc::clone(it), message));
                     }
-                    Err(_) => { /* sender is dead */break; }
+                    /* sender is dead */
+                    Err(_) => break
                 }
             }
         });
     }
 
-    pub fn on_message<M: Send + Sync + 'static>(&self, callback: Callback<M>) {
-        self.tx.send(SubscriberTask::RegisterCallback { callback: Box::new(callback), type_id: TypeId::of::<M>() }).unwrap()
-    }
+    pub fn on_message<F, M>(&mut self, callback: F) where F: Fn(&M) + Send + 'static, M: Send + Sync + 'static {
 
-    fn receive<M: Send + Sync + 'static>(&self, message: Arc<M>) {
-        self.tx.send(SubscriberTask::Run {
+        // TODO remove this unwrap
+        self.tx.send(SubscriberTask::RegisterCallback {
+            callback: Box::new(Callback::new(callback)),
             type_id: TypeId::of::<M>(),
-            payload: Box::new(message),
-            callback: SendBoxFnOnce::new(|c: Arc<Box<Any>>, payload: Box<Any>| {
-                let callback = c.downcast_ref::<Callback<M>>().unwrap();
-                let message = payload.downcast_ref::<Arc<M>>().unwrap();
-                callback.call(message);
-            }
-            ),
-        }).unwrap() // TODO error handling
+        }).unwrap()
     }
 }
 
@@ -210,6 +195,25 @@ mod tests {
 
 
     #[test]
+    fn can_send_a_simple_message_to_2_subscriber2() {
+        let bus = Bus::new();
+        let mut subscriber = bus.create_subscriber();
+        let mut subscriber2 = bus.create_subscriber();
+
+        let (tx, rx) = channel();
+        let (tx2, rx2) = channel();
+
+        subscriber.on_message(move |_: &()| tx.send(()).unwrap());
+        subscriber2.on_message(move |_: &()| tx2.send(()).unwrap());
+
+        bus.publish(());
+
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(rx2.recv_timeout(Duration::from_secs(1)).is_ok());
+    }
+
+
+    #[test]
     fn can_send_a_complex_message_to_a_subscriber() {
         let bus = Bus::new();
         let mut subscriber = bus.create_subscriber();
@@ -226,6 +230,39 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "hello world".to_string());
+    }
+
+    #[test]
+    fn can_send_simple_messages_to_a_subscriber_from_multiple_threads() {
+        let bus = Bus::new();
+        let mut subscriber = bus.create_subscriber();
+
+        let (tx, rx) = channel();
+
+        subscriber.on_message(move |_: &()| tx.send(()).unwrap());
+
+        bus.publish(());
+        thread::spawn(move || bus.publish(()));
+
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn can_send_simple_messages_to_a_subscriber_from_cloned_instance() {
+        let bus = Bus::new();
+        let mut subscriber = bus.create_subscriber();
+
+        let (tx, rx) = channel();
+
+        subscriber.on_message(move |_: &()| tx.send(()).unwrap());
+
+        bus.publish(());
+        let bus2 = bus.clone();
+        bus2.publish(());
+
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
     }
 }
 

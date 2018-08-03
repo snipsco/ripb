@@ -15,7 +15,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::Arc;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
@@ -28,7 +28,6 @@ use std::thread;
 #[derive(Clone)]
 pub struct Bus {
     tx: Sender<BusTask>,
-    subscriber_id_source: Arc<AtomicUsize>,
 }
 
 /// A subscriber to a [`Bus`].
@@ -133,7 +132,6 @@ impl Bus {
                         while let Some(index) = indexes_to_remove.pop() {
                             subscribers.remove(index);
                         }
-
                     }
                     Ok(BusTask::RegisterSubscriber { subscriber }) => subscribers.push(subscriber),
                     /* senders are dead */
@@ -143,7 +141,7 @@ impl Bus {
         }
         );
 
-        Self { tx, subscriber_id_source: Arc::new(AtomicUsize::from(0)) }
+        Self { tx }
     }
 
     /// Create a new subscriber for this bus
@@ -197,7 +195,7 @@ impl Subscriber {
 
     /// Register a new callback to be called each time a message of the given type is published on
     /// the bus, callback lives as until the `Subscriber` is dropped
-    pub fn on_message<F, M>(& self, callback: F) where F: Fn(&M) + Send + 'static, M: Message + 'static {
+    pub fn on_message<F, M>(&self, callback: F) where F: Fn(&M) + Send + 'static, M: Message + 'static {
         self.tx.send(SubscriberTask::RegisterCallback {
             callback: Box::new(Callback::new(callback)),
             type_id: TypeId::of::<M>(),
@@ -207,7 +205,7 @@ impl Subscriber {
     /// Register a new callback to be called each time a message of the given type is published on
     /// the bus, callback lives as until the `SubscriptionToken` is dropped, `unsubscribe` is
     /// called on it or the `Subscriber` is dropped
-    pub fn on_message_with_token<F, M>(& self, callback: F) -> SubscriptionToken where F: Fn(&M) + Send + 'static, M: Message + 'static {
+    pub fn on_message_with_token<F, M>(&self, callback: F) -> SubscriptionToken where F: Fn(&M) + Send + 'static, M: Message + 'static {
         self.on_message(callback);
 
         SubscriptionToken { type_id: TypeId::of::<M>(), tx: self.tx.clone() }
@@ -228,8 +226,9 @@ pub struct SubscriptionToken {
 
 impl SubscriptionToken {
     pub fn unsubscribe(&self) {
-        // TODO error management remove this unwrap
-        self.tx.send(SubscriberTask::UnregisterCallback { type_id: self.type_id }).unwrap()
+        // if sending does't work here, the worker thread is dead so we're already unsubscribed
+        // and we can ignore the error
+        let _ = self.tx.send(SubscriberTask::UnregisterCallback { type_id: self.type_id });
     }
 }
 
@@ -367,9 +366,26 @@ mod tests {
     }
 
     #[test]
+    fn can_unsubscribe_a_token_for_a_dropped_subscriber_without_crashing() {
+        fn drop_subscriber(_sub: Subscriber) {}
+        let bus = Bus::new();
+        let (tx, rx) = channel();
+        let subscriber = bus.create_subscriber();
+        let token = subscriber.on_message_with_token(move |_: &()| tx.send(()).unwrap());
+        bus.publish(());
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
+
+        drop_subscriber(subscriber);
+        bus.publish(());
+
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_err());
+
+        token.unsubscribe();
+    }
+
+    #[test]
     fn dropping_subscribers_drops_the_corresponding_subscription() {
         fn drop_subscriber(_sub: Subscriber) {}
-
 
         let bus = Bus::new();
         let (tx, rx) = channel();

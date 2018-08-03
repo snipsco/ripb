@@ -15,28 +15,31 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::mpsc::{Sender, Receiver, channel};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
-
 
 /// An in process bus.
 ///
 /// You can create a bus with the [`new`] method, then create new [`Subscriber`]s with the
 /// [`create_subscriber`] method, and push some messages on the bus with the [`publish`] method.
-/// If you need to send messages from multiple threads, [`clone`] the bus and use one instance per thread
+/// If you need to send messages from multiple threads, [`clone`] the bus and use one instance per
+/// thread
 #[derive(Clone)]
 pub struct Bus {
     tx: Sender<BusTask>,
+    subscriber_id_source: Arc<AtomicUsize>,
 }
 
 /// A subscriber to a [`Bus`].
 ///
 /// Subscribers are created with the method [`Bus.create_subscriber`]
 ///
-/// Register new callbacks with the [`on_message`] method
+/// Register new callbacks with the [`on_message`] method, callback will leav until the subscriber
+/// is dropped. If you need more control on callback lifecycle use [`on_message_with_token`] that
+/// will give you a [`SubscriptionToken`] you can use to [`unsubscribe`] a callback.
 pub struct Subscriber {
-    tx: Sender<SubscriberTask>
+    tx: Sender<SubscriberTask>,
 }
 
 enum BusTask {
@@ -56,7 +59,6 @@ impl<T: Send + Sync> Message for T {}
 type BoxedMessage = Box<Any + Send + Sync>;
 type BoxedCallback = Box<Any + Send>;
 
-
 enum SubscriberTask {
     Receive {
         type_id: TypeId,
@@ -67,6 +69,10 @@ enum SubscriberTask {
         type_id: TypeId,
         callback: BoxedCallback,
     },
+    UnregisterCallback {
+        type_id: TypeId,
+    },
+    Stop,
 }
 
 struct Worker {
@@ -110,17 +116,24 @@ impl Bus {
 
         thread::spawn(move || {
             let mut subscribers: Vec<Sender<SubscriberTask>> = vec![];
+            let mut indexes_to_remove = vec![];
             loop {
                 match rx.recv() {
                     Ok(BusTask::Publish { type_id, message, worker }) => {
                         let callback = Arc::new(worker);
-                        for subscriber in subscribers.iter() {
-                            subscriber.send(SubscriberTask::Receive {
+                        for (index, subscriber) in subscribers.iter().enumerate() {
+                            if subscriber.send(SubscriberTask::Receive {
                                 type_id,
                                 message: Arc::clone(&message),
                                 worker: Arc::clone(&callback),
-                            }).unwrap() // TODO what should we do if this fails ? remove the subscriber ?
+                            }).is_err() {
+                                indexes_to_remove.push(index);
+                            }
                         }
+                        while let Some(index) = indexes_to_remove.pop() {
+                            subscribers.remove(index);
+                        }
+
                     }
                     Ok(BusTask::RegisterSubscriber { subscriber }) => subscribers.push(subscriber),
                     /* senders are dead */
@@ -130,7 +143,7 @@ impl Bus {
         }
         );
 
-        Self { tx }
+        Self { tx, subscriber_id_source: Arc::new(AtomicUsize::from(0)) }
     }
 
     /// Create a new subscriber for this bus
@@ -154,12 +167,11 @@ impl Subscriber {
     fn new() -> Self {
         let (tx, rx) = channel();
         let result = Self {
-            tx,
+            tx
         };
         result.start(rx);
         result
     }
-
 
     fn start(&self, rx: Receiver<SubscriberTask>) {
         thread::spawn(move || {
@@ -169,10 +181,14 @@ impl Subscriber {
                     Ok(SubscriberTask::RegisterCallback { type_id, callback }) => {
                         callbacks.insert(type_id, Arc::new(callback));
                     }
+                    Ok(SubscriberTask::UnregisterCallback { type_id }) => {
+                        callbacks.remove(&type_id);
+                    }
                     Ok(SubscriberTask::Receive { type_id, message, worker }) => {
                         callbacks.get(&type_id).map(|it| worker.call(Arc::clone(it), Arc::clone(&message)));
                     }
-                    /* sender is dead */
+                    Ok(SubscriberTask::Stop) => break,
+                    /* sender is dead, bus is stopped, let's stop too */
                     Err(_) => break
                 }
             }
@@ -180,24 +196,55 @@ impl Subscriber {
     }
 
     /// Register a new callback to be called each time a message of the given type is published on
-    /// the bus
-    pub fn on_message<F, M>(&self, callback: F) where F: Fn(&M) + Send + 'static, M: Message + 'static {
-
-        // TODO remove this unwrap
+    /// the bus, callback lives as until the `Subscriber` is dropped
+    pub fn on_message<F, M>(& self, callback: F) where F: Fn(&M) + Send + 'static, M: Message + 'static {
         self.tx.send(SubscriberTask::RegisterCallback {
             callback: Box::new(Callback::new(callback)),
             type_id: TypeId::of::<M>(),
-        }).unwrap()
+        }).unwrap();
+    }
+
+    /// Register a new callback to be called each time a message of the given type is published on
+    /// the bus, callback lives as until the `SubscriptionToken` is dropped, `unsubscribe` is
+    /// called on it or the `Subscriber` is dropped
+    pub fn on_message_with_token<F, M>(& self, callback: F) -> SubscriptionToken where F: Fn(&M) + Send + 'static, M: Message + 'static {
+        self.on_message(callback);
+
+        SubscriptionToken { type_id: TypeId::of::<M>(), tx: self.tx.clone() }
     }
 }
 
+impl Drop for Subscriber {
+    fn drop(&mut self) {
+        let _ = self.tx.send(SubscriberTask::Stop);
+    }
+}
+
+#[must_use]
+pub struct SubscriptionToken {
+    type_id: TypeId,
+    tx: Sender<SubscriberTask>,
+}
+
+impl SubscriptionToken {
+    pub fn unsubscribe(&self) {
+        // TODO error management remove this unwrap
+        self.tx.send(SubscriberTask::UnregisterCallback { type_id: self.type_id }).unwrap()
+    }
+}
+
+impl Drop for SubscriptionToken {
+    fn drop(&mut self) {
+        self.unsubscribe()
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::mpsc::channel;
-    use std::time::Duration;
     use std::thread;
+    use std::time::Duration;
+    use super::*;
 
     #[test]
     fn can_send_a_simple_message_to_a_subscriber() {
@@ -215,7 +262,7 @@ mod tests {
 
 
     #[test]
-    fn can_send_a_simple_message_to_2_subscriber2() {
+    fn can_send_a_simple_message_to_2_subscribers() {
         let bus = Bus::new();
         let subscriber = bus.create_subscriber();
         let subscriber2 = bus.create_subscriber();
@@ -283,6 +330,71 @@ mod tests {
 
         assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
         assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn can_unsubscribe_callbacks() {
+        let bus = Bus::new();
+        let subscriber = bus.create_subscriber();
+
+        let (tx, rx) = channel();
+
+        let token = subscriber.on_message_with_token(move |_: &()| tx.send(()).unwrap());
+        bus.publish(());
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
+
+        token.unsubscribe();
+        bus.publish(());
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn cannot_receive_messages_in_a_dropped_subscriber() {
+        let bus = Bus::new();
+        let (tx, rx) = channel();
+        {
+            let subscriber = bus.create_subscriber();
+
+            subscriber.on_message(move |_: &()| tx.send(()).unwrap());
+            bus.publish(());
+            assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
+            // subscriber is dropped here
+        };
+
+        bus.publish(());
+
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn dropping_subscribers_drops_the_corresponding_subscription() {
+        fn drop_subscriber(_sub: Subscriber) {}
+
+
+        let bus = Bus::new();
+        let (tx, rx) = channel();
+        let (tx2, rx2) = channel();
+        let (tx3, rx3) = channel();
+
+        let subscriber = bus.create_subscriber();
+        subscriber.on_message(move |_: &()| tx.send(()).unwrap());
+        let subscriber2 = bus.create_subscriber();
+        subscriber2.on_message(move |_: &()| tx2.send(()).unwrap());
+        let subscriber3 = bus.create_subscriber();
+        subscriber3.on_message(move |_: &()| tx3.send(()).unwrap());
+
+        bus.publish(());
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(rx2.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(rx3.recv_timeout(Duration::from_secs(1)).is_ok());
+        drop_subscriber(subscriber);
+        drop_subscriber(subscriber3);
+
+        bus.publish(());
+
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_err());
+        assert!(rx2.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(rx3.recv_timeout(Duration::from_secs(1)).is_err());
     }
 }
 

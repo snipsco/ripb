@@ -4,3 +4,12 @@ version = "0.1.0"
 authors = ["Thibaut Lorrain <fredszaq@gmail.com>"]
 
 [dependencies]
+crossbeam-channel = "0.2"
+
+[dev-dependencies]
+bencher = "0.1"
+
+
+[[bench]]
+name = "bench"
+harness = false

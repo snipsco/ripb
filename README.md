@@ -14,6 +14,6 @@ s1 and s2, both s1 and s2 will receive the messages in the order m1, m2,
 
 ## Implementation
 
-Current implementation uses `channel`s, a `thread` to run the bus, and a
-`thread` per subscriber. `Any` and `TypeId` are used to to be able to
-expose a type-safe api
+Current implementation uses [`crossbeam-channel`]s, a fixed number of
+threads [`Any`] and [`TypeId`] are used to to be able to expose a
+type-safe api

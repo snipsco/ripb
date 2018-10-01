@@ -18,6 +18,7 @@ extern crate num_cpus;
 
 use crossbeam_channel::{Receiver, Sender};
 use std::any::{Any, TypeId};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -131,7 +132,7 @@ impl<M: Message> Callback<M> {
 }
 
 struct BusState {
-    subs: HashMap<usize, Receiver<SubscriberState>>,
+    subs: HashMap<usize, Cell<Receiver<SubscriberState>>>,
     tasks: Receiver<BusTask>,
     thread_count: usize,
 }
@@ -162,9 +163,10 @@ impl BusWorker {
         loop {
             match self.tasks.recv() {
                 Some(BusWorkerTask::ManageBusState { state }) => self.manage_bus_state(state),
-                Some(BusWorkerTask::ManageSubscriberState { state, task, next_state }) => self.manage_subscriber_state(state, task, next_state),
+                Some(BusWorkerTask::ManageSubscriberState { state, task, next_state }) =>
+                    self.manage_subscriber_state(state, task, next_state),
                 Some(BusWorkerTask::Stop) => break,
-                None => panic!("none in bus run")
+                None => panic!("None in bus run, this is a bug in ripb")
             }
         }
     }
@@ -175,38 +177,51 @@ impl BusWorker {
             Some(BusTask::Publish { type_id, message, worker }) => {
                 let worker = Arc::new(worker);
 
-                for (_sub_id, sub) in subs.iter_mut() {
+                for sub in subs.values_mut() {
                     let (next_state, new_sub) = crossbeam_channel::bounded(1);
                     let task = SubscriberTask::Receive {
                         type_id,
                         message: Arc::clone(&message),
                         worker: Arc::clone(&worker),
                     };
-                    let state = sub.clone(); // FIXME this is ugly
-                    *sub = new_sub;
-                    self.backlog.send(BusWorkerTask::ManageSubscriberState { state, task, next_state })
+                    let state = sub.replace(new_sub);
+                    self.backlog.send(BusWorkerTask::ManageSubscriberState {
+                        state,
+                        task,
+                        next_state,
+                    })
                 }
             }
             Some(BusTask::RegisterSubscriber { subscriber, subscriber_id }) => {
                 let (next_state, new_sub) = crossbeam_channel::bounded(1);
-                subs.insert(subscriber_id, new_sub);
+                subs.insert(subscriber_id, Cell::new(new_sub));
                 next_state.send(subscriber)
             }
             Some(BusTask::UnregisterSubscriber { subscriber_id }) => {
                 subs.remove(&subscriber_id);
             }
-            Some(BusTask::RegisterSubscriberCallback { subscriber_id, callback_id, type_id, callback }) => {
+            Some(BusTask::RegisterSubscriberCallback {
+                     subscriber_id, callback_id, type_id, callback
+                 }) => {
                 let (next_state, new_sub) = crossbeam_channel::bounded(1);
-                if let Some(state) = subs.insert(subscriber_id, new_sub) {
+                if let Some(state) = subs.insert(subscriber_id, Cell::new(new_sub)) {
                     let task = SubscriberTask::RegisterCallback { callback_id, type_id, callback };
-                    self.backlog.send(BusWorkerTask::ManageSubscriberState { state, task, next_state })
+                    self.backlog.send(BusWorkerTask::ManageSubscriberState {
+                        state: state.into_inner(),
+                        task,
+                        next_state,
+                    })
                 }
             }
             Some(BusTask::UnregisterSubscriberCallback { subscriber_id, callback_id, type_id }) => {
                 let (next_state, new_sub) = crossbeam_channel::bounded(1);
-                if let Some(state) = subs.insert(subscriber_id, new_sub) {
+                if let Some(state) = subs.insert(subscriber_id, Cell::new(new_sub)) {
                     let task = SubscriberTask::UnregisterCallback { callback_id, type_id };
-                    self.backlog.send(BusWorkerTask::ManageSubscriberState { state, task, next_state })
+                    self.backlog.send(BusWorkerTask::ManageSubscriberState {
+                        state: state.into_inner(),
+                        task,
+                        next_state,
+                    })
                 }
             }
             None => {
@@ -218,10 +233,15 @@ impl BusWorker {
                 }
             }
         }
-        self.backlog.send(BusWorkerTask::ManageBusState { state: BusState { subs, tasks, thread_count } })
+        self.backlog.send(BusWorkerTask::ManageBusState {
+            state: BusState { subs, tasks, thread_count }
+        })
     }
 
-    fn manage_subscriber_state(&self, state: Receiver<SubscriberState>, task: SubscriberTask, next_state: Sender<SubscriberState>) {
+    fn manage_subscriber_state(&self,
+                               state: Receiver<SubscriberState>,
+                               task: SubscriberTask,
+                               next_state: Sender<SubscriberState>) {
         match state.try_recv() {
             Some(mut state) => {
                 match task {
@@ -246,7 +266,11 @@ impl BusWorker {
             }
             // TODO be smart and avoid a busy loop here if there are only messages for a subscriber
             // TODO that is taking a bit of time
-            None => self.backlog.send(BusWorkerTask::ManageSubscriberState { state, task, next_state })
+            None => self.backlog.send(BusWorkerTask::ManageSubscriberState {
+                state,
+                task,
+                next_state,
+            })
         }
     }
 }
@@ -264,7 +288,9 @@ impl Bus {
 
         for i in 0..thread_count {
             let worker = BusWorker { tasks: tasks.clone(), backlog: backlog.clone() };
-            thread::Builder::new().name(format!("ripb.worker{}", i)).spawn(move || worker.run());
+            let _ = thread::Builder::new()
+                .name(format!("ripb.worker{}", i))
+                .spawn(move || worker.run());
         }
         backlog.send(BusWorkerTask::ManageBusState {
             state: BusState { subs: HashMap::new(), tasks: bus_tasks, thread_count }
@@ -279,7 +305,8 @@ impl Bus {
         let control = self.control.clone();
         let callback_id_source = AtomicUsize::from(0);
         self.control.send(BusTask::RegisterSubscriber {
-            subscriber: SubscriberState { callbacks: HashMap::new() }, subscriber_id
+            subscriber: SubscriberState { callbacks: HashMap::new() },
+            subscriber_id,
         });
         Subscriber { subscriber_id, control, callback_id_source }
     }
@@ -295,7 +322,8 @@ impl Bus {
 }
 
 impl Subscriber {
-    fn on_message_inner<F, M>(&self, callback: F) -> usize where F: Fn(&M) + Send + 'static, M: Message + 'static {
+    fn on_message_inner<F, M>(&self, callback: F) -> usize
+        where F: Fn(&M) + Send + 'static, M: Message + 'static {
         let callback_id = self.callback_id_source.fetch_add(1, Ordering::Relaxed);
         self.control.send(BusTask::RegisterSubscriberCallback {
             subscriber_id: self.subscriber_id,
@@ -308,14 +336,16 @@ impl Subscriber {
 
     /// Register a new callback to be called each time a message of the given type is published on
     /// the bus, callback lives as until the `Subscriber` is dropped
-    pub fn on_message<F, M>(&self, callback: F) where F: Fn(&M) + Send + 'static, M: Message + 'static {
+    pub fn on_message<F, M>(&self, callback: F)
+        where F: Fn(&M) + Send + 'static, M: Message + 'static {
         self.on_message_inner(callback);
     }
 
     /// Register a new callback to be called each time a message of the given type is published on
     /// the bus, callback lives as until the `SubscriptionToken` is dropped, `unsubscribe` is
     /// called on it or the `Subscriber` is dropped
-    pub fn on_message_with_token<F, M>(&self, callback: F) -> SubscriptionToken where F: Fn(&M) + Send + 'static, M: Message + 'static {
+    pub fn on_message_with_token<F, M>(&self, callback: F) -> SubscriptionToken
+        where F: Fn(&M) + Send + 'static, M: Message + 'static {
         SubscriptionToken {
             subscriber_id: self.subscriber_id,
             callback_id: self.on_message_inner(callback),
@@ -341,7 +371,11 @@ pub struct SubscriptionToken {
 
 impl SubscriptionToken {
     pub fn unsubscribe(&self) {
-        self.control.send(BusTask::UnregisterSubscriberCallback { type_id: self.type_id, callback_id: self.callback_id, subscriber_id: self.subscriber_id })
+        self.control.send(BusTask::UnregisterSubscriberCallback {
+            type_id: self.type_id,
+            callback_id: self.callback_id,
+            subscriber_id: self.subscriber_id,
+        })
     }
 }
 
@@ -527,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn can_multiple_message_handlers_for_othe_same_message_on_a_single_receiver() {
+    fn can_register_multiple_message_handlers_for_the_same_message_on_a_single_receiver() {
         fn drop_token(_sub: SubscriptionToken) {}
 
         let bus = Bus::new();

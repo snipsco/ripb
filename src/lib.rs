@@ -156,7 +156,7 @@ enum BusWorkerTask {
         tasks: Vec<SubscriberTask>,
         next_states: Vec<Sender<SubscriberState>>,
     },
-    Stop,
+    Stop { state: BusState },
 }
 
 struct BusWorker {
@@ -175,19 +175,33 @@ impl BusWorker {
     }
 
     fn handle_task(&self, task: BusWorkerTask) -> bool {
-        match task {
+        return match task {
             BusWorkerTask::ManageBusState { state } => self.manage_bus_state(state),
             BusWorkerTask::ManageSubscriberState { state, task, next_state } =>
                 self.manage_subscriber_state(state, task, next_state),
             BusWorkerTask::ManageSlowSubscribersStates { states, tasks, next_states } =>
                 self.manage_slow_subscribers_states(states, tasks, next_states),
-            BusWorkerTask::Stop => return false,
+            BusWorkerTask::Stop { state } => self.handle_stop(state)
         }
-        return true;
     }
 
-    fn manage_bus_state(&self, state: BusState) {
+    fn handle_stop(&self, mut state: BusState) -> bool {
+        let should_continue = self.tasks.len() > 0;
+
+        if !should_continue {
+            state.thread_count -= 1;
+        }
+
+        if state.thread_count > 0 {
+            self.backlog.send(BusWorkerTask::Stop { state })
+        }
+
+        should_continue
+    }
+
+    fn manage_bus_state(&self, state: BusState) -> bool {
         let BusState { mut subs, tasks, thread_count } = state;
+        let mut should_continue = true;
         match tasks.recv() {
             Some(BusTask::Publish { type_id, message, worker }) => {
                 let worker = Arc::new(worker);
@@ -227,7 +241,7 @@ impl BusWorker {
                         next_state,
                     })
                 } else {
-                    // remove the entry we just added, or it could come back and bite us later
+                    // remove the bogus entry we just added, or it could come back and bite us later
                     subs.remove(&subscriber_id);
                 }
             }
@@ -241,30 +255,30 @@ impl BusWorker {
                         next_state,
                     })
                 } else {
-                    // remove the entry we just added, or it could come back and bite us later
+                    // remove the bogus entry we just added, or it could come back and bite us later
                     subs.remove(&subscriber_id);
                 }
             }
             None => {
                 if self.backlog.len() == 0 {
                     // No new message can arrive on the bus, and the backlog is empty, so lets stop
-                    // TODO these conditions are probably not enough, there may still be some work
-                    // TODO being done on the bus, find a better way to stop
-                    for _ in 0..thread_count {
-                        self.backlog.send(BusWorkerTask::Stop)
-                    }
+                    should_continue = false;
                 }
             }
         }
-        self.backlog.send(BusWorkerTask::ManageBusState {
-            state: BusState { subs, tasks, thread_count }
-        })
+        let state = BusState { subs, tasks, thread_count };
+        if should_continue {
+            self.backlog.send(BusWorkerTask::ManageBusState { state });
+        } else {
+            self.backlog.send(BusWorkerTask::Stop { state })
+        }
+        return true
     }
 
     fn manage_subscriber_state(&self,
                                state: Receiver<SubscriberState>,
                                task: SubscriberTask,
-                               next_state: Sender<SubscriberState>) {
+                               next_state: Sender<SubscriberState>) -> bool {
         match state.try_recv() {
             Some(state) => self.perform_subscriber_task(state, task, next_state),
             // If we simply repost the task there are some cases where we'll en up with a busy loop
@@ -277,6 +291,7 @@ impl BusWorker {
                 next_states: vec![next_state],
             })
         }
+        return true
     }
 
     fn perform_subscriber_task(&self,
@@ -307,7 +322,7 @@ impl BusWorker {
     fn manage_slow_subscribers_states(&self,
                                       mut states: Vec<Receiver<SubscriberState>>,
                                       mut tasks: Vec<SubscriberTask>,
-                                      mut next_states: Vec<Sender<SubscriberState>>) {
+                                      mut next_states: Vec<Sender<SubscriberState>>) -> bool {
         enum Action {
             Exec {
                 state: SubscriberState,
@@ -331,9 +346,7 @@ impl BusWorker {
                             .position(|x| x==from)
                             .expect("could not find channel that recved, this is a bug in ripb")},
                     None => {
-
-
-                        panic!(format!("None while receiving on a state, this is a bug in ripb {:?}", tasks.len()))
+                        panic!("None while receiving on a state, this is a bug in ripb {:?}")
                     }
                 }
             }
@@ -354,8 +367,7 @@ impl BusWorker {
             }
         );
 
-
-        match action {
+        return match action {
             Action::Exec { state, index } => {
                 states.remove(index);
                 let task = tasks.remove(index);
@@ -367,7 +379,8 @@ impl BusWorker {
                         next_states,
                     });
                 }
-                self.perform_subscriber_task(state, task, next_state)
+                self.perform_subscriber_task(state, task, next_state);
+                true
             }
             Action::Merge { mut other_states, mut other_tasks, mut other_next_states } => {
                 states.append(&mut other_states);
@@ -378,6 +391,7 @@ impl BusWorker {
                     tasks,
                     next_states,
                 });
+                true
             }
             Action::Other { task } => {
                 self.backlog.send(BusWorkerTask::ManageSlowSubscribersStates {
@@ -385,7 +399,7 @@ impl BusWorker {
                     tasks,
                     next_states,
                 });
-                self.handle_task(task); // TODO there we don't handle properly the stopping mecanics
+                self.handle_task(task)
             }
         }
     }
@@ -647,7 +661,7 @@ mod tests {
             token.unsubscribe(); // we don't want that to panic
         }
 
-        ::std::thread::sleep(::std::time::Duration::from_secs(1))
+        ::std::thread::sleep(::std::time::Duration::from_millis(100))
     }
 
     #[test]
@@ -708,10 +722,11 @@ mod tests {
         assert!(rx2.recv_timeout(Duration::from_secs(1)).is_ok());
         assert!(rx3.recv_timeout(Duration::from_secs(1)).is_err());
     }
-    
+
     #[test]
     fn no_busyloop() {
-        // Watch cpu usage during the 10 first secs of executing this, it should be nearly 0%
+        // Watch cpu usage during the 2 first secs of executing this, it should be nearly 0%
+        // you may want to up the sleep time to make this more visible
 
         let bus = Bus::with_thread_count(4);
 
@@ -719,7 +734,7 @@ mod tests {
         let (tx, rx) = channel();
 
         subscriber.on_message(move |_: &()| {
-            ::std::thread::sleep(::std::time::Duration::from_secs(5));
+            ::std::thread::sleep(::std::time::Duration::from_secs(1));
             tx.send(()).unwrap();
         });
 

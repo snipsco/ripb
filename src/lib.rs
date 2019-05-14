@@ -116,7 +116,12 @@ impl Worker {
     }
 
     pub fn call(&self, callback: &BoxedCallback, payload: Arc<BoxedMessage>) {
-        (self.worker)(callback, payload)
+        //(self.worker)(callback, payload)
+        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe (
+            ||(self.worker)(callback, payload))
+        ) {
+            println!("Callback did panic: {:?}", e);
+        }
     }
 }
 
@@ -745,6 +750,33 @@ mod tests {
         assert_eq!(rx.recv().expect("recv 1"), ());
         assert_eq!(rx.recv().expect("recv 2"), ());
         assert_eq!(rx.recv().expect("recv 3"), ());
+    }
+
+
+    #[test]
+    fn panic_in_subscribe() {
+        let bus = Bus::with_thread_count(4);
+        let subscriber = bus.create_subscriber();
+
+        let (tx, rx) = channel();
+        subscriber.on_message(move |_:&()| {
+            tx.send(());
+            panic!("yolo")
+        });
+
+        bus.publish(());
+        bus.publish(());
+        bus.publish(());
+        bus.publish(());
+        bus.publish(());
+        bus.publish(());
+
+        assert_eq!(rx.recv().expect("recv 1"), ());
+        assert_eq!(rx.recv().expect("recv 2"), ());
+        assert_eq!(rx.recv().expect("recv 3"), ());
+        assert_eq!(rx.recv().expect("recv 4"), ());
+        assert_eq!(rx.recv().expect("recv 5"), ());
+        assert_eq!(rx.recv().expect("recv 6"), ());
     }
 }
 

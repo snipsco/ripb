@@ -160,18 +160,21 @@ enum BusWorkerTask {
 }
 
 struct BusWorker {
+    id: usize,
     tasks: Receiver<BusWorkerTask>,
     backlog: Sender<BusWorkerTask>,
 }
 
 impl BusWorker {
     fn run(&self) {
+        log::info!("worker {} started", self.id);
         loop {
             match self.tasks.recv() {
                 Some(task) => if !self.handle_task(task) { break; },
                 None => panic!("None in bus worker run, this is a bug in ripb")
             }
         }
+        log::info!("worker {} fisnished", self.id);
     }
 
     fn handle_task(&self, task: BusWorkerTask) -> bool {
@@ -416,10 +419,10 @@ impl Bus {
         let (backlog, tasks) = crossbeam_channel::unbounded();
         let (control, bus_tasks) = crossbeam_channel::unbounded();
 
-        for i in 0..thread_count {
-            let worker = BusWorker { tasks: tasks.clone(), backlog: backlog.clone() };
+        for id in 0..thread_count {
+            let worker = BusWorker { id, tasks: tasks.clone(), backlog: backlog.clone() };
             let _ = thread::Builder::new()
-                .name(format!("ripb.worker{}", i))
+                .name(format!("ripb.worker{}", id))
                 .spawn(move || worker.run());
         }
         backlog.send(BusWorkerTask::ManageBusState {

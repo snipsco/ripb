@@ -12,15 +12,11 @@
 //!
 //! Current implementation uses [`crossbeam-channel`]s, a fixed number of threads [`Any`] and
 //! [`TypeId`] are used to to be able to expose a type-safe api
-
-#[macro_use]
-extern crate crossbeam_channel;
-extern crate num_cpus;
-
 use crossbeam_channel::{Receiver, Select, Sender};
 use std::any::{Any, TypeId};
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -508,13 +504,16 @@ impl BusWorker {
 impl Bus {
     /// Create a new bus, with a thread count equal to the number of CPUs
     pub fn new() -> Self {
-        Self::with_thread_count(num_cpus::get())
+        Self::with_thread_count(
+            NonZeroUsize::new(num_cpus::get()).expect("Number of CPU should be non zero"),
+        )
     }
 
     /// Create a new bus with the given thread count
-    pub fn with_thread_count(thread_count: usize) -> Self {
+    pub fn with_thread_count(thread_count: NonZeroUsize) -> Self {
         let (backlog, tasks) = crossbeam_channel::unbounded();
         let (control, bus_tasks) = crossbeam_channel::unbounded();
+        let thread_count = thread_count.get();
 
         for id in 0..thread_count {
             let worker = BusWorker {
@@ -628,18 +627,19 @@ pub struct SubscriptionToken {
 }
 
 impl SubscriptionToken {
-    pub fn unsubscribe(&self) {
-        self.control.send(BusTask::UnregisterSubscriberCallback {
-            type_id: self.type_id,
-            callback_id: self.callback_id,
-            subscriber_id: self.subscriber_id,
-        });
+    pub fn unsubscribe(self) {
+        // unsubscription is done when drop occurs
+        drop(self)
     }
 }
 
 impl Drop for SubscriptionToken {
     fn drop(&mut self) {
-        self.unsubscribe()
+        self.control.send(BusTask::UnregisterSubscriberCallback {
+            type_id: self.type_id,
+            callback_id: self.callback_id,
+            subscriber_id: self.subscriber_id,
+        });
     }
 }
 
@@ -858,7 +858,7 @@ mod tests {
         // Watch cpu usage during the 2 first secs of executing this, it should be nearly 0%
         // you may want to up the sleep time to make this more visible
 
-        let bus = Bus::with_thread_count(4);
+        let bus = Bus::with_thread_count(NonZeroUsize::new(4).unwrap());
 
         let subscriber = bus.create_subscriber();
         let (tx, rx) = channel();

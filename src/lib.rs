@@ -218,7 +218,8 @@ impl BusWorker {
         }
 
         if state.thread_count > 0 {
-            self.backlog.send(BusWorkerTask::Stop { state });
+            // we own a receiver so sending should not fail
+            self.backlog.send(BusWorkerTask::Stop { state }).unwrap();
         }
 
         should_continue
@@ -247,11 +248,14 @@ impl BusWorker {
                         worker: Arc::clone(&worker),
                     };
                     let state = sub.replace(new_sub);
-                    self.backlog.send(BusWorkerTask::ManageSubscriberState {
-                        state,
-                        task,
-                        next_state,
-                    });
+                    // we own a receiver so sending should not fail
+                    self.backlog
+                        .send(BusWorkerTask::ManageSubscriberState {
+                            state,
+                            task,
+                            next_state,
+                        })
+                        .unwrap();
                 }
             }
             Ok(BusTask::RegisterSubscriber {
@@ -259,8 +263,9 @@ impl BusWorker {
                 subscriber_id,
             }) => {
                 let (next_state, new_sub) = crossbeam_channel::bounded(1);
+                // receiver is still alive as it is in the scope
+                next_state.send(subscriber).unwrap();
                 subs.insert(subscriber_id, Cell::new(new_sub));
-                next_state.send(subscriber);
             }
             Ok(BusTask::UnregisterSubscriber { subscriber_id }) => {
                 subs.remove(&subscriber_id);
@@ -278,11 +283,14 @@ impl BusWorker {
                         type_id,
                         callback,
                     };
-                    self.backlog.send(BusWorkerTask::ManageSubscriberState {
-                        state: state.into_inner(),
-                        task,
-                        next_state,
-                    });
+                    // we own a receiver so sending should not fail
+                    self.backlog
+                        .send(BusWorkerTask::ManageSubscriberState {
+                            state: state.into_inner(),
+                            task,
+                            next_state,
+                        })
+                        .unwrap();
                 } else {
                     // remove the bogus entry we just added, or it could come back and bite us later
                     subs.remove(&subscriber_id);
@@ -299,11 +307,14 @@ impl BusWorker {
                         callback_id,
                         type_id,
                     };
-                    self.backlog.send(BusWorkerTask::ManageSubscriberState {
-                        state: state.into_inner(),
-                        task,
-                        next_state,
-                    });
+                    // we own a receiver so sending should not fail
+                    self.backlog
+                        .send(BusWorkerTask::ManageSubscriberState {
+                            state: state.into_inner(),
+                            task,
+                            next_state,
+                        })
+                        .unwrap();
                 } else {
                     // remove the bogus entry we just added, or it could come back and bite us later
                     subs.remove(&subscriber_id);
@@ -323,9 +334,13 @@ impl BusWorker {
             thread_count,
         };
         if should_continue {
-            self.backlog.send(BusWorkerTask::ManageBusState { state });
+            // we own a receiver so sending should not fail
+            self.backlog
+                .send(BusWorkerTask::ManageBusState { state })
+                .unwrap();
         } else {
-            self.backlog.send(BusWorkerTask::Stop { state });
+            // we own a receiver so sending should not fail
+            self.backlog.send(BusWorkerTask::Stop { state }).unwrap();
         }
         return true;
     }
@@ -395,7 +410,10 @@ impl BusWorker {
                     .retain(|(it, _)| *it != callback_id);
             }
         }
-        next_state.send(state);
+
+        next_state
+            .send(state)
+            .expect("state channel for subscriber should not be disconnected");
     }
 
     fn manage_slow_subscribers_states(
@@ -434,9 +452,9 @@ impl BusWorker {
                 let task = oper.recv(&self.tasks);
                 match task {
                     Ok(BusWorkerTask::ManageSlowSubscribersStates {
-                        states: mut other_states,
-                        tasks: mut other_tasks,
-                        next_states: mut other_next_states,
+                        states: other_states,
+                        tasks: other_tasks,
+                        next_states: other_next_states,
                     }) => Action::Merge {
                         other_states,
                         other_tasks,
@@ -462,12 +480,14 @@ impl BusWorker {
                 let task = tasks.remove(index);
                 let next_state = next_states.remove(index);
                 if states.len() > 0 {
+                    // we own a receiver so sending should not fail
                     self.backlog
                         .send(BusWorkerTask::ManageSlowSubscribersStates {
                             states,
                             tasks,
                             next_states,
-                        });
+                        })
+                        .unwrap();
                 }
                 self.perform_subscriber_task(state, task, next_state);
                 true
@@ -480,26 +500,34 @@ impl BusWorker {
                 states.append(&mut other_states);
                 tasks.append(&mut other_tasks);
                 next_states.append(&mut other_next_states);
+                // we own a receiver so sending should not fail
                 self.backlog
                     .send(BusWorkerTask::ManageSlowSubscribersStates {
                         states,
                         tasks,
                         next_states,
-                    });
+                    })
+                    .unwrap();
                 true
             }
             Action::Other { task } => {
+                // we own a receiver so sending should not fail
                 self.backlog
                     .send(BusWorkerTask::ManageSlowSubscribersStates {
                         states,
                         tasks,
                         next_states,
-                    });
+                    })
+                    .unwrap();
                 self.handle_task(task)
             }
         };
     }
 }
+
+/// Error produced when a bus operation is impossible. Getting such an error the bus is dead
+#[derive(Debug)]
+pub struct DeadBusError;
 
 impl Bus {
     /// Create a new bus, with a thread count equal to the number of CPUs
@@ -525,13 +553,17 @@ impl Bus {
                 .name(format!("ripb.worker{}", id))
                 .spawn(move || worker.run());
         }
-        backlog.send(BusWorkerTask::ManageBusState {
-            state: BusState {
-                subs: HashMap::new(),
-                tasks: bus_tasks,
-                thread_count,
-            },
-        });
+
+        // receiver still in scope so sending should not fail
+        backlog
+            .send(BusWorkerTask::ManageBusState {
+                state: BusState {
+                    subs: HashMap::new(),
+                    tasks: bus_tasks,
+                    thread_count,
+                },
+            })
+            .unwrap();
 
         Bus {
             control,
@@ -544,12 +576,14 @@ impl Bus {
         let subscriber_id = self.subscriber_id_source.fetch_add(1, Ordering::Relaxed);
         let control = self.control.clone();
         let callback_id_source = AtomicUsize::from(0);
-        self.control.send(BusTask::RegisterSubscriber {
-            subscriber: SubscriberState {
-                callbacks: HashMap::new(),
-            },
-            subscriber_id,
-        });
+        self.control
+            .send(BusTask::RegisterSubscriber {
+                subscriber: SubscriberState {
+                    callbacks: HashMap::new(),
+                },
+                subscriber_id,
+            })
+            .expect("could not communicate with the bus, did a worker thread panic ?");
         Subscriber {
             subscriber_id,
             control,
@@ -559,60 +593,73 @@ impl Bus {
 
     /// Publish a new message on this bus
     pub fn publish<M: Message + 'static>(&self, message: M) {
-        self.control.send(BusTask::Publish {
-            type_id: TypeId::of::<M>(),
-            message: Arc::new(Box::new(message)),
-            worker: Worker::of::<M>(),
-        });
+        self.control
+            .send(BusTask::Publish {
+                type_id: TypeId::of::<M>(),
+                message: Arc::new(Box::new(message)),
+                worker: Worker::of::<M>(),
+            })
+            .expect("could not communicate with the bus, did a worker thread panic ?")
     }
 }
 
 impl Subscriber {
-    fn on_message_inner<F, M>(&self, callback: F) -> usize
+    fn on_message_inner<F, M>(&self, callback: F) -> Result<usize, DeadBusError>
     where
         F: Fn(&M) + Send + 'static,
         M: Message + 'static,
     {
         let callback_id = self.callback_id_source.fetch_add(1, Ordering::Relaxed);
-        self.control.send(BusTask::RegisterSubscriberCallback {
-            subscriber_id: self.subscriber_id,
-            callback_id,
-            callback: Box::new(Callback::new(callback)),
-            type_id: TypeId::of::<M>(),
-        });
-        callback_id
+        self.control
+            .send(BusTask::RegisterSubscriberCallback {
+                subscriber_id: self.subscriber_id,
+                callback_id,
+                callback: Box::new(Callback::new(callback)),
+                type_id: TypeId::of::<M>(),
+            })
+            .map_err(|_| DeadBusError)?;
+        Ok(callback_id)
     }
 
     /// Register a new callback to be called each time a message of the given type is published on
     /// the bus, callback lives as until the `Subscriber` is dropped
-    pub fn on_message<F, M>(&self, callback: F)
+    pub fn on_message<F, M>(&self, callback: F) -> Result<(), DeadBusError>
     where
         F: Fn(&M) + Send + 'static,
         M: Message + 'static,
     {
-        self.on_message_inner(callback);
+        self.on_message_inner(callback)?;
+        Ok(())
     }
 
     /// Register a new callback to be called each time a message of the given type is published on
     /// the bus, callback lives as until the `SubscriptionToken` is dropped, `unsubscribe` is
     /// called on it or the `Subscriber` is dropped
-    pub fn on_message_with_token<F, M>(&self, callback: F) -> SubscriptionToken
+    pub fn on_message_with_token<F, M>(
+        &self,
+        callback: F,
+    ) -> Result<SubscriptionToken, DeadBusError>
     where
         F: Fn(&M) + Send + 'static,
         M: Message + 'static,
     {
-        SubscriptionToken {
+        Ok(SubscriptionToken {
             subscriber_id: self.subscriber_id,
-            callback_id: self.on_message_inner(callback),
+            callback_id: self.on_message_inner(callback)?,
             type_id: TypeId::of::<M>(),
             control: self.control.clone(),
-        }
+        })
+    }
+
+    pub fn is_alive() -> bool {
+        unimplemented!()
     }
 }
 
 impl Drop for Subscriber {
     fn drop(&mut self) {
-        self.control.send(BusTask::UnregisterSubscriber {
+        // this may fail if the bus is already stopped, but in that case we don't care
+        let _ = self.control.send(BusTask::UnregisterSubscriber {
             subscriber_id: self.subscriber_id,
         });
     }
@@ -635,7 +682,8 @@ impl SubscriptionToken {
 
 impl Drop for SubscriptionToken {
     fn drop(&mut self) {
-        self.control.send(BusTask::UnregisterSubscriberCallback {
+        // this may fail if the bus is already stopped, but in that case we don't care
+        let _ = self.control.send(BusTask::UnregisterSubscriberCallback {
             type_id: self.type_id,
             callback_id: self.callback_id,
             subscriber_id: self.subscriber_id,
@@ -657,7 +705,9 @@ mod tests {
 
         let (tx, rx) = channel();
 
-        subscriber.on_message(move |_: &()| tx.send(()).unwrap());
+        subscriber
+            .on_message(move |_: &()| tx.send(()).unwrap())
+            .unwrap();
 
         bus.publish(());
 
@@ -673,8 +723,12 @@ mod tests {
         let (tx, rx) = channel();
         let (tx2, rx2) = channel();
 
-        subscriber.on_message(move |_: &()| tx.send(()).unwrap());
-        subscriber2.on_message(move |_: &()| tx2.send(()).unwrap());
+        subscriber
+            .on_message(move |_: &()| tx.send(()).unwrap())
+            .unwrap();
+        subscriber2
+            .on_message(move |_: &()| tx2.send(()).unwrap())
+            .unwrap();
 
         bus.publish(());
 
@@ -693,7 +747,9 @@ mod tests {
             payload: String,
         }
 
-        subscriber.on_message(move |m: &Message| tx.send(m.payload.clone()).unwrap());
+        subscriber
+            .on_message(move |m: &Message| tx.send(m.payload.clone()).unwrap())
+            .unwrap();
 
         bus.publish(Message {
             payload: "hello world".into(),
@@ -712,7 +768,9 @@ mod tests {
 
         let (tx, rx) = channel();
 
-        subscriber.on_message(move |_: &()| tx.send(()).unwrap());
+        subscriber
+            .on_message(move |_: &()| tx.send(()).unwrap())
+            .unwrap();
 
         bus.publish(());
         thread::spawn(move || bus.publish(()));
@@ -728,7 +786,9 @@ mod tests {
 
         let (tx, rx) = channel();
 
-        subscriber.on_message(move |_: &()| tx.send(()).unwrap());
+        subscriber
+            .on_message(move |_: &()| tx.send(()).unwrap())
+            .unwrap();
 
         bus.publish(());
         let bus2 = bus.clone();
@@ -745,7 +805,9 @@ mod tests {
 
         let (tx, rx) = channel();
 
-        let token = subscriber.on_message_with_token(move |_: &()| tx.send(()).unwrap());
+        let token = subscriber
+            .on_message_with_token(move |_: &()| tx.send(()).unwrap())
+            .unwrap();
         bus.publish(());
         assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
 
@@ -761,7 +823,9 @@ mod tests {
         {
             let subscriber = bus.create_subscriber();
 
-            subscriber.on_message(move |_: &()| tx.send(()).unwrap());
+            subscriber
+                .on_message(move |_: &()| tx.send(()).unwrap())
+                .unwrap();
             bus.publish(());
             assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
             // subscriber is dropped here
@@ -779,7 +843,9 @@ mod tests {
             let bus = Bus::new();
             let (tx, rx) = channel();
             let subscriber = bus.create_subscriber();
-            let token = subscriber.on_message_with_token(move |_: &()| tx.send(()).unwrap());
+            let token = subscriber
+                .on_message_with_token(move |_: &()| tx.send(()).unwrap())
+                .unwrap();
             bus.publish(());
             assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
 
@@ -804,11 +870,17 @@ mod tests {
         let (tx3, rx3) = channel();
 
         let subscriber = bus.create_subscriber();
-        subscriber.on_message(move |_: &()| tx.send(()).unwrap());
+        subscriber
+            .on_message(move |_: &()| tx.send(()).unwrap())
+            .unwrap();
         let subscriber2 = bus.create_subscriber();
-        subscriber2.on_message(move |_: &()| tx2.send(()).unwrap());
+        subscriber2
+            .on_message(move |_: &()| tx2.send(()).unwrap())
+            .unwrap();
         let subscriber3 = bus.create_subscriber();
-        subscriber3.on_message(move |_: &()| tx3.send(()).unwrap());
+        subscriber3
+            .on_message(move |_: &()| tx3.send(()).unwrap())
+            .unwrap();
 
         bus.publish(());
         assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
@@ -834,9 +906,15 @@ mod tests {
         let (tx3, rx3) = channel();
 
         let subscriber = bus.create_subscriber();
-        let t = subscriber.on_message_with_token(move |_: &()| tx.send(()).unwrap());
-        subscriber.on_message(move |_: &()| tx2.send(()).unwrap());
-        let t3 = subscriber.on_message_with_token(move |_: &()| tx3.send(()).unwrap());
+        let t = subscriber
+            .on_message_with_token(move |_: &()| tx.send(()).unwrap())
+            .unwrap();
+        subscriber
+            .on_message(move |_: &()| tx2.send(()).unwrap())
+            .unwrap();
+        let t3 = subscriber
+            .on_message_with_token(move |_: &()| tx3.send(()).unwrap())
+            .unwrap();
 
         bus.publish(());
         assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
@@ -863,10 +941,12 @@ mod tests {
         let subscriber = bus.create_subscriber();
         let (tx, rx) = channel();
 
-        subscriber.on_message(move |_: &()| {
-            ::std::thread::sleep(::std::time::Duration::from_secs(1));
-            tx.send(()).unwrap();
-        });
+        subscriber
+            .on_message(move |_: &()| {
+                ::std::thread::sleep(::std::time::Duration::from_secs(1));
+                tx.send(()).unwrap();
+            })
+            .unwrap();
 
         bus.publish(());
         bus.publish(());

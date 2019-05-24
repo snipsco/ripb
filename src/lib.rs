@@ -12,10 +12,11 @@
 //!
 //! Current implementation uses [`crossbeam-channel`]s, a fixed number of threads [`Any`] and
 //! [`TypeId`] are used to to be able to expose a type-safe api
-use crossbeam_channel::{Receiver, Select, Sender};
+use crossbeam_channel::{Receiver, RecvError, Select, Sender, TryRecvError};
 use std::any::{Any, TypeId};
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -48,6 +49,7 @@ pub struct Subscriber {
     callback_id_source: AtomicUsize,
 }
 
+#[derive(Debug)]
 enum BusTask {
     Publish {
         type_id: TypeId,
@@ -72,6 +74,9 @@ enum BusTask {
         callback_id: usize,
         type_id: TypeId,
     },
+    Stop {
+        halted_tx: Sender<()>,
+    },
 }
 
 /// A message on must be [`Send`] and [`Sync`] to be sent on the bus.
@@ -82,6 +87,7 @@ impl<T: Send + Sync> Message for T {}
 type BoxedMessage = Box<Any + Send + Sync>;
 type BoxedCallback = Box<Any + Send>;
 
+#[derive(Debug)]
 enum SubscriberTask {
     Receive {
         type_id: TypeId,
@@ -101,6 +107,12 @@ enum SubscriberTask {
 
 struct Worker {
     worker: Box<Fn(&BoxedCallback, Arc<BoxedMessage>) + Send + Sync>,
+}
+
+impl Debug for Worker {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(f, "<Worker>")
+    }
 }
 
 impl Worker {
@@ -147,26 +159,55 @@ struct BusState {
     thread_count: usize,
 }
 
+impl Debug for BusState {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(
+            f,
+            "BusState {{ subs: <{}>, tasks: {:?}, thread_count: {} }}",
+            self.subs.len(),
+            self.tasks,
+            self.thread_count
+        )
+    }
+}
+
 struct SubscriberState {
     callbacks: HashMap<TypeId, Vec<(usize, BoxedCallback)>>,
 }
 
+impl Debug for SubscriberState {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(
+            f,
+            "SubscriberState {{ callbacks: {:?} }}",
+            self.callbacks
+                .iter()
+                .map(|it| (it.0.clone(), format!("<{} callbacks>", it.1.len())))
+                .collect::<HashMap<TypeId, String>>()
+        )
+    }
+}
+
+#[derive(Debug)]
 enum BusWorkerTask {
     ManageBusState {
         state: BusState,
     },
     ManageSubscriberState {
+        subscriber_id: usize,
         state: Receiver<SubscriberState>,
         task: SubscriberTask,
         next_state: Sender<SubscriberState>,
     },
     ManageSlowSubscribersStates {
+        subscriber_ids: Vec<usize>,
         states: Vec<Receiver<SubscriberState>>,
         tasks: Vec<SubscriberTask>,
         next_states: Vec<Sender<SubscriberState>>,
     },
     Stop {
         state: BusState,
+        halted_tx: Option<Sender<()>>,
     },
 }
 
@@ -186,61 +227,94 @@ impl BusWorker {
                         break;
                     }
                 }
-                //TODO
-                Err(_) => panic!("None in bus worker run, this is a bug in ripb"),
+                Err(RecvError {}) => panic!("Task/backlog channel closed, this should not happen"),
             }
         }
         log::info!("worker {} fisnished", self.id);
     }
 
     fn handle_task(&self, task: BusWorkerTask) -> bool {
+        log::debug!("bus worker {} handling {:?}", self.id, task);
         return match task {
             BusWorkerTask::ManageBusState { state } => self.manage_bus_state(state),
             BusWorkerTask::ManageSubscriberState {
+                subscriber_id,
                 state,
                 task,
                 next_state,
-            } => self.manage_subscriber_state(state, task, next_state),
+            } => self.manage_subscriber_state(subscriber_id, state, task, next_state),
             BusWorkerTask::ManageSlowSubscribersStates {
+                subscriber_ids,
                 states,
                 tasks,
                 next_states,
-            } => self.manage_slow_subscribers_states(states, tasks, next_states),
-            BusWorkerTask::Stop { state } => self.handle_stop(state),
+            } => self.manage_slow_subscribers_states(subscriber_ids, states, tasks, next_states),
+            BusWorkerTask::Stop { state, halted_tx } => self.handle_stop(state, halted_tx),
         };
     }
 
-    fn handle_stop(&self, mut state: BusState) -> bool {
+    fn handle_stop(&self, mut state: BusState, halted_tx: Option<Sender<()>>) -> bool {
+        log::debug!("bus worker {} handling a stop task", self.id);
+
         let should_continue = self.tasks.len() > 0;
 
         if !should_continue {
             state.thread_count -= 1;
+            log::debug!("threadcount is now {}", state.thread_count);
         }
+
+        log::debug!(
+            "bus worker {} remaining subs : {}",
+            self.id,
+            state.subs.len(),
+        );
 
         if state.thread_count > 0 {
             // we own a receiver so sending should not fail
-            self.backlog.send(BusWorkerTask::Stop { state }).unwrap();
+            self.backlog
+                .send(BusWorkerTask::Stop { state, halted_tx })
+                .unwrap();
+        } else {
+            log::debug!("bus is done");
+            drop(state);
+            if let Some(halted_tx) = halted_tx {
+                halted_tx.send(()).unwrap();
+            }
         }
 
         should_continue
     }
 
     fn manage_bus_state(&self, state: BusState) -> bool {
+        log::debug!("bus worker {} managing the bus state", self.id);
+
         let BusState {
             mut subs,
             tasks,
             thread_count,
         } = state;
         let mut should_continue = true;
-        match tasks.recv() {
-            Ok(BusTask::Publish {
+        let mut halted_tx_opt = None;
+
+        let task = tasks
+            .recv()
+            .expect("bus task channel was closed without sending a stop command");
+
+        log::debug!(
+            "bus worker {} managing the bus state with task {:?}",
+            self.id,
+            task,
+        );
+
+        match task {
+            BusTask::Publish {
                 type_id,
                 message,
                 worker,
-            }) => {
+            } => {
                 let worker = Arc::new(worker);
 
-                for sub in subs.values_mut() {
+                for (subscriber_id, sub) in subs.iter_mut() {
                     let (next_state, new_sub) = crossbeam_channel::bounded(1);
                     let task = SubscriberTask::Receive {
                         type_id,
@@ -251,6 +325,7 @@ impl BusWorker {
                     // we own a receiver so sending should not fail
                     self.backlog
                         .send(BusWorkerTask::ManageSubscriberState {
+                            subscriber_id: *subscriber_id,
                             state,
                             task,
                             next_state,
@@ -258,24 +333,31 @@ impl BusWorker {
                         .unwrap();
                 }
             }
-            Ok(BusTask::RegisterSubscriber {
+            BusTask::RegisterSubscriber {
                 subscriber,
                 subscriber_id,
-            }) => {
+            } => {
                 let (next_state, new_sub) = crossbeam_channel::bounded(1);
                 // receiver is still alive as it is in the scope
                 next_state.send(subscriber).unwrap();
                 subs.insert(subscriber_id, Cell::new(new_sub));
             }
-            Ok(BusTask::UnregisterSubscriber { subscriber_id }) => {
-                subs.remove(&subscriber_id);
+            BusTask::UnregisterSubscriber { subscriber_id } => {
+                // make sure all tasks for this subscriber have finished executing
+                // the recv here is blocking, if it poses some performance problems it can be
+                // sub in a new bus task
+                subs.remove(&subscriber_id)
+                    .expect("trying to remove a non existing subscriber")
+                    .get_mut()
+                    .recv()
+                    .expect("subscriber channel should not be close");
             }
-            Ok(BusTask::RegisterSubscriberCallback {
+            BusTask::RegisterSubscriberCallback {
                 subscriber_id,
                 callback_id,
                 type_id,
                 callback,
-            }) => {
+            } => {
                 let (next_state, new_sub) = crossbeam_channel::bounded(1);
                 if let Some(state) = subs.insert(subscriber_id, Cell::new(new_sub)) {
                     let task = SubscriberTask::RegisterCallback {
@@ -286,21 +368,21 @@ impl BusWorker {
                     // we own a receiver so sending should not fail
                     self.backlog
                         .send(BusWorkerTask::ManageSubscriberState {
+                            subscriber_id,
                             state: state.into_inner(),
                             task,
                             next_state,
                         })
                         .unwrap();
                 } else {
-                    // remove the bogus entry we just added, or it could come back and bite us later
-                    subs.remove(&subscriber_id);
+                    panic!("trying to register a callback for an unknown subscriber")
                 }
             }
-            Ok(BusTask::UnregisterSubscriberCallback {
+            BusTask::UnregisterSubscriberCallback {
                 subscriber_id,
                 callback_id,
                 type_id,
-            }) => {
+            } => {
                 let (next_state, new_sub) = crossbeam_channel::bounded(1);
                 if let Some(state) = subs.insert(subscriber_id, Cell::new(new_sub)) {
                     let task = SubscriberTask::UnregisterCallback {
@@ -310,29 +392,34 @@ impl BusWorker {
                     // we own a receiver so sending should not fail
                     self.backlog
                         .send(BusWorkerTask::ManageSubscriberState {
+                            subscriber_id,
                             state: state.into_inner(),
                             task,
                             next_state,
                         })
                         .unwrap();
                 } else {
-                    // remove the bogus entry we just added, or it could come back and bite us later
-                    subs.remove(&subscriber_id);
+                    panic!("trying to unregister a callback for an unknown subscriber")
                 }
             }
-            // TODO, only disconnected ?
-            Err(_) => {
-                if self.backlog.len() == 0 {
-                    // No new message can arrive on the bus, and the backlog is empty, so lets stop
-                    should_continue = false;
-                }
+            BusTask::Stop { halted_tx } => {
+                should_continue = false;
+                halted_tx_opt = Some(halted_tx)
             }
         }
+
         let state = BusState {
             subs,
             tasks,
             thread_count,
         };
+
+        log::debug!(
+            "bus worker {} remaining subs : {}",
+            self.id,
+            state.subs.len(),
+        );
+
         if should_continue {
             // we own a receiver so sending should not fail
             self.backlog
@@ -340,42 +427,64 @@ impl BusWorker {
                 .unwrap();
         } else {
             // we own a receiver so sending should not fail
-            self.backlog.send(BusWorkerTask::Stop { state }).unwrap();
+            self.backlog
+                .send(BusWorkerTask::Stop {
+                    state,
+                    halted_tx: halted_tx_opt,
+                })
+                .unwrap()
         }
         return true;
     }
 
     fn manage_subscriber_state(
         &self,
+        subscriber_id: usize,
         state: Receiver<SubscriberState>,
         task: SubscriberTask,
         next_state: Sender<SubscriberState>,
     ) -> bool {
+        log::debug!(
+            "bus worker {} trying to manage state of subscriber {}",
+            self.id,
+            subscriber_id,
+        );
         match state.try_recv() {
-            Ok(state) => self.perform_subscriber_task(state, task, next_state),
+            Ok(state) => self.perform_subscriber_task(subscriber_id, state, task, next_state),
             // If we simply repost the task there are some cases where we'll en up with a busy loop
             // (e.g. if one subscriber is taking its time and there are only tasks for it in the
             // backlog). We don't want that so we need to handle slow subscribers a little more
             // carefully
-            // TODO
-            Err(_) => self
+            Err(TryRecvError::Empty) => self
                 .backlog
                 .send(BusWorkerTask::ManageSlowSubscribersStates {
+                    subscriber_ids: vec![subscriber_id],
                     states: vec![state],
                     tasks: vec![task],
                     next_states: vec![next_state],
                 })
                 .unwrap(),
+            Err(TryRecvError::Disconnected) => {
+                panic!("Channel for subscriber state is disconnected")
+            }
         }
         return true;
     }
 
     fn perform_subscriber_task(
         &self,
+        subscriber_id: usize,
         mut state: SubscriberState,
         task: SubscriberTask,
         next_state: Sender<SubscriberState>,
     ) {
+        log::debug!(
+            "bus worker {} performing task {:?} for subscriber {} with state {:?}",
+            self.id,
+            task,
+            subscriber_id,
+            state,
+        );
         match task {
             SubscriberTask::Receive {
                 type_id,
@@ -418,16 +527,23 @@ impl BusWorker {
 
     fn manage_slow_subscribers_states(
         &self,
+        mut subscriber_ids: Vec<usize>,
         mut states: Vec<Receiver<SubscriberState>>,
         mut tasks: Vec<SubscriberTask>,
         mut next_states: Vec<Sender<SubscriberState>>,
     ) -> bool {
+        log::debug!(
+            "bus worker {} trying to manage states of {} slow subscribers",
+            self.id,
+            subscriber_ids.len(),
+        );
         enum Action {
             Exec {
                 state: SubscriberState,
                 index: usize,
             },
             Merge {
+                other_ids: Vec<usize>,
                 other_states: Vec<Receiver<SubscriberState>>,
                 other_tasks: Vec<SubscriberTask>,
                 other_next_states: Vec<Sender<SubscriberState>>,
@@ -452,24 +568,28 @@ impl BusWorker {
                 let task = oper.recv(&self.tasks);
                 match task {
                     Ok(BusWorkerTask::ManageSlowSubscribersStates {
+                        subscriber_ids: other_ids,
                         states: other_states,
                         tasks: other_tasks,
                         next_states: other_next_states,
                     }) => Action::Merge {
+                        other_ids,
                         other_states,
                         other_tasks,
                         other_next_states,
                     },
                     Ok(task) => Action::Other { task },
-                    //TODO
-                    Err(_) => panic!("None while receiving on backlog, this is a bug in ripb"),
+                    Err(RecvError {}) => {
+                        panic!("Task/backlog channel closed, this should not happen")
+                    }
                 }
             } else {
                 let state = oper.recv(&states[index]);
                 match state {
                     Ok(state) => Action::Exec { state, index },
-                    //TODO
-                    Err(_) => panic!("None while receiving on a state, this is a bug in ripb {:?}"),
+                    Err(RecvError {}) => {
+                        panic!("state channel for slow subscriber should not be disconnected")
+                    }
                 }
             }
         };
@@ -477,32 +597,48 @@ impl BusWorker {
         return match action {
             Action::Exec { state, index } => {
                 states.remove(index);
+                let subscriber_id = subscriber_ids.remove(index);
+                log::debug!(
+                    "bus worker {} managing state of subscriber {}",
+                    self.id,
+                    subscriber_id,
+                );
                 let task = tasks.remove(index);
                 let next_state = next_states.remove(index);
                 if states.len() > 0 {
                     // we own a receiver so sending should not fail
                     self.backlog
                         .send(BusWorkerTask::ManageSlowSubscribersStates {
+                            subscriber_ids,
                             states,
                             tasks,
                             next_states,
                         })
                         .unwrap();
                 }
-                self.perform_subscriber_task(state, task, next_state);
+                self.perform_subscriber_task(subscriber_id, state, task, next_state);
                 true
             }
             Action::Merge {
+                mut other_ids,
                 mut other_states,
                 mut other_tasks,
                 mut other_next_states,
             } => {
+                log::debug!(
+                    "bus worker {} adding {} subscribers to task already containing {}",
+                    self.id,
+                    other_ids.len(),
+                    subscriber_ids.len(),
+                );
+                subscriber_ids.append(&mut other_ids);
                 states.append(&mut other_states);
                 tasks.append(&mut other_tasks);
                 next_states.append(&mut other_next_states);
                 // we own a receiver so sending should not fail
                 self.backlog
                     .send(BusWorkerTask::ManageSlowSubscribersStates {
+                        subscriber_ids,
                         states,
                         tasks,
                         next_states,
@@ -511,9 +647,11 @@ impl BusWorker {
                 true
             }
             Action::Other { task } => {
+                log::debug!("bus worker {} executing another task", self.id);
                 // we own a receiver so sending should not fail
                 self.backlog
                     .send(BusWorkerTask::ManageSlowSubscribersStates {
+                        subscriber_ids,
                         states,
                         tasks,
                         next_states,
@@ -603,6 +741,22 @@ impl Bus {
     }
 }
 
+impl Drop for Bus {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.subscriber_id_source) == 1 {
+            // we're dropping the last instance for this bus, lets kill the bus
+            let (halted_tx, halted_rx) = crossbeam_channel::bounded(1);
+            self.control.send(BusTask::Stop { halted_tx }).unwrap(); // TODO
+            if halted_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err()
+            {
+                panic!("bus didn't stop properly after 5 seconds");
+            }
+        }
+    }
+}
+
 impl Subscriber {
     fn on_message_inner<F, M>(&self, callback: F) -> Result<usize, DeadBusError>
     where
@@ -647,12 +801,8 @@ impl Subscriber {
             subscriber_id: self.subscriber_id,
             callback_id: self.on_message_inner(callback)?,
             type_id: TypeId::of::<M>(),
-            control: self.control.clone(),
+            subscriber: &self,
         })
-    }
-
-    pub fn is_alive() -> bool {
-        unimplemented!()
     }
 }
 
@@ -666,28 +816,31 @@ impl Drop for Subscriber {
 }
 
 #[must_use]
-pub struct SubscriptionToken {
+pub struct SubscriptionToken<'a> {
     type_id: TypeId,
     subscriber_id: usize,
     callback_id: usize,
-    control: Sender<BusTask>,
+    subscriber: &'a Subscriber,
 }
 
-impl SubscriptionToken {
+impl<'a> SubscriptionToken<'a> {
     pub fn unsubscribe(self) {
         // unsubscription is done when drop occurs
         drop(self)
     }
 }
 
-impl Drop for SubscriptionToken {
+impl<'a> Drop for SubscriptionToken<'a> {
     fn drop(&mut self) {
         // this may fail if the bus is already stopped, but in that case we don't care
-        let _ = self.control.send(BusTask::UnregisterSubscriberCallback {
-            type_id: self.type_id,
-            callback_id: self.callback_id,
-            subscriber_id: self.subscriber_id,
-        });
+        let _ = self
+            .subscriber
+            .control
+            .send(BusTask::UnregisterSubscriberCallback {
+                type_id: self.type_id,
+                callback_id: self.callback_id,
+                subscriber_id: self.subscriber_id,
+            });
     }
 }
 
@@ -837,30 +990,6 @@ mod tests {
     }
 
     #[test]
-    fn can_unsubscribe_a_token_for_a_dropped_subscriber_without_crashing() {
-        fn drop_subscriber(_sub: Subscriber) {}
-        {
-            let bus = Bus::new();
-            let (tx, rx) = channel();
-            let subscriber = bus.create_subscriber();
-            let token = subscriber
-                .on_message_with_token(move |_: &()| tx.send(()).unwrap())
-                .unwrap();
-            bus.publish(());
-            assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
-
-            drop_subscriber(subscriber);
-            bus.publish(());
-
-            assert!(rx.recv_timeout(Duration::from_secs(1)).is_err());
-
-            token.unsubscribe(); // we don't want that to panic
-        }
-
-        ::std::thread::sleep(::std::time::Duration::from_millis(100))
-    }
-
-    #[test]
     fn dropping_subscribers_drops_the_corresponding_subscription() {
         fn drop_subscriber(_sub: Subscriber) {}
 
@@ -932,6 +1061,32 @@ mod tests {
     }
 
     #[test]
+    fn subscriber_on_a_dropped_bus_should_generate_dead_bus_error_on_subscribe() {
+        let bus = Bus::new();
+        let subscriber = bus.create_subscriber();
+        drop(bus);
+        let r = subscriber.on_message(|_: &()| {});
+        assert!(r.is_err())
+    }
+
+    #[test]
+    fn can_drop_the_bus_while_it_is_still_working() {
+        let bus = Bus::new();
+        let subscriber = bus.create_subscriber();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let r = subscriber.on_message(move |_: &()| tx.send(()).unwrap());
+
+        for _ in 0..100 {
+            bus.publish(())
+        }
+
+        drop(bus);
+
+        assert_eq!(rx.len(), 100)
+    }
+
+    #[test]
+    #[ignore]
     fn no_busyloop() {
         // Watch cpu usage during the 2 first secs of executing this, it should be nearly 0%
         // you may want to up the sleep time to make this more visible

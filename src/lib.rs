@@ -22,8 +22,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-//mod legacy;
-
 /// An in process bus.
 ///
 /// You can create a bus with the [`new`] method, then create new [`Subscriber`]s with the

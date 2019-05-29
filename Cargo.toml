@@ -1,6 +1,6 @@
 [package]
 name = "ripb"
-version = "0.2.0"
+version = "0.3.0-pre"
 authors = ["Thibaut Lorrain <fredszaq@gmail.com>"]
 edition = "2018"
 description = "A rust crate providing an implementation of a lock-free type-safe in-process bus."

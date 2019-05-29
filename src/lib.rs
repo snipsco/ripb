@@ -665,6 +665,17 @@ impl BusWorker {
 #[derive(Debug)]
 pub struct DeadBusError;
 
+impl std::error::Error for DeadBusError {}
+
+impl std::fmt::Display for DeadBusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        write!(
+            f,
+            "A new callback was registered on a ripb subscriber for a dropped bus"
+        )
+    }
+}
+
 impl Bus {
     /// Create a new bus, with a thread count equal to the number of CPUs
     pub fn new() -> Self {

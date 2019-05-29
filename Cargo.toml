@@ -3,6 +3,10 @@ name = "ripb"
 version = "0.1.0"
 authors = ["Thibaut Lorrain <fredszaq@gmail.com>"]
 edition = "2018"
+description = "A rust crate providing an implementation of a lock-free type-safe in-process bus."
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/snipsco/ripb"
+readme = "README.md"
 
 [dependencies]
 crossbeam-channel = "0.3"

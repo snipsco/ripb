@@ -14,8 +14,9 @@ s1 and s2, both s1 and s2 will receive the messages in the order m1, m2,
 
 ## Implementation
 
-Current implementation uses [`crossbeam-channel`]s and a fixed number of
-threads. [`Any`] and [`TypeId`] are used to to be able to expose a
+Current implementation uses [`crossbeam-channel`](https://crates.io/crates/crossbeam-channel)s 
+and a fixed number of threads. [`Any`](https://doc.rust-lang.org/std/any/trait.Any.html) and 
+[`TypeId`](https://doc.rust-lang.org/std/any/struct.TypeId.html) are used to to be able to expose a
 type-safe api.
 
 

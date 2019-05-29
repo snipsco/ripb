@@ -15,9 +15,7 @@ fn create_bus(bench: &mut Bencher) {
 fn register_callback_on_single_subscriber(bench: &mut Bencher) {
     let bus = Bus::new();
     let sub = bus.create_subscriber();
-    bench.iter(move || {
-        sub.on_message(|_: &()| {})
-    })
+    bench.iter(move || sub.on_message(|_: &()| {}))
 }
 
 fn create_10_subscribers(bench: &mut Bencher) {
@@ -39,17 +37,23 @@ fn create_n_subscribers(bench: &mut Bencher, n: u32) {
     })
 }
 
-fn send_m_messages_to_n_subscribers(bench: &mut Bencher, m:u32, n: u32) {
+fn send_m_messages_to_n_subscribers(bench: &mut Bencher, m: u32, n: u32) {
     let bus = Bus::new();
     let subs: Vec<Subscriber> = (0..n).map(|_| bus.create_subscriber()).collect();
     let (tx, rx) = channel();
     for sub in &subs {
         let _tx = tx.clone();
-        sub.on_message(move |_: &()| _tx.send(()).expect("could not send message"));
+        sub.on_message(move |_: &()| _tx.send(()).expect("could not send message"))
+            .unwrap();
     }
     bench.iter(|| {
-        for _ in 0..m { bus.publish(()) }
-        for _ in 0..m*n { rx.recv_timeout(std::time::Duration::from_secs(1)).expect("could not receive message") }
+        for _ in 0..m {
+            bus.publish(())
+        }
+        for _ in 0..m * n {
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .expect("could not receive message")
+        }
     })
 }
 
@@ -117,7 +121,8 @@ fn send_1000_messages_to_1000_subscribers(bench: &mut Bencher) {
     send_m_messages_to_n_subscribers(bench, 1000, 1000)
 }
 
-benchmark_group!(benches,
+benchmark_group!(
+    benches,
     create_bus,
     create_10_subscribers,
     create_100_subscribers,

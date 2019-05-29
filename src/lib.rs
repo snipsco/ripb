@@ -12,7 +12,7 @@
 //!
 //! Current implementation uses [`crossbeam-channel`]s, a fixed number of threads [`Any`] and
 //! [`TypeId`] are used to to be able to expose a type-safe api
-use crossbeam_channel::{Receiver, RecvError, Select, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Select, Sender, TryRecvError};
 use std::any::{Any, TypeId};
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -461,7 +461,7 @@ impl BusWorker {
                     tasks: vec![task],
                     next_states: vec![next_state],
                 })
-                .unwrap(),
+                .expect("backlog channel was disconnected"),
             Err(TryRecvError::Disconnected) => {
                 panic!("Channel for subscriber state is disconnected")
             }
@@ -612,7 +612,7 @@ impl BusWorker {
                             tasks,
                             next_states,
                         })
-                        .unwrap();
+                        .expect("backlog channel was disconnected");
                 }
                 self.perform_subscriber_task(subscriber_id, state, task, next_state);
                 true
@@ -641,7 +641,7 @@ impl BusWorker {
                         tasks,
                         next_states,
                     })
-                    .unwrap();
+                    .expect("backlog channel was disconnected");
                 true
             }
             Action::Other { task } => {
@@ -654,7 +654,7 @@ impl BusWorker {
                         tasks,
                         next_states,
                     })
-                    .unwrap();
+                    .expect("backlog channel was disconnected");
                 self.handle_task(task)
             }
         };
@@ -699,7 +699,7 @@ impl Bus {
                     thread_count,
                 },
             })
-            .unwrap();
+            .expect("backlog channel was disconnected");
 
         Bus {
             control,
@@ -741,15 +741,20 @@ impl Bus {
 
 impl Drop for Bus {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.subscriber_id_source) == 1 {
-            // we're dropping the last instance for this bus, lets kill the bus
+        let arc_count = Arc::strong_count(&self.subscriber_id_source);
+        log::debug!("Dropping a Bus, arc count is {}", arc_count);
+        if arc_count == 1 {
+            log::debug!("This is the last instance for this bus, killing it");
             let (halted_tx, halted_rx) = crossbeam_channel::bounded(1);
-            self.control.send(BusTask::Stop { halted_tx }).unwrap(); // TODO
-            if halted_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .is_err()
-            {
-                panic!("bus didn't stop properly after 5 seconds");
+            self.control
+                .send(BusTask::Stop { halted_tx })
+                .expect("control channel was disconnected");
+            match halted_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("bus didn't stop properly after 5 seconds")
+                }
+                Err(RecvTimeoutError::Disconnected) => panic!("stop channel was closed"),
+                Ok(()) => {}
             }
         }
     }
@@ -1072,7 +1077,9 @@ mod tests {
         let bus = Bus::new();
         let subscriber = bus.create_subscriber();
         let (tx, rx) = crossbeam_channel::unbounded();
-        let r = subscriber.on_message(move |_: &()| tx.send(()).unwrap());
+        subscriber
+            .on_message(move |_: &()| tx.send(()).unwrap())
+            .unwrap();
 
         for _ in 0..100 {
             bus.publish(())

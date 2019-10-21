@@ -82,8 +82,8 @@ pub trait Message: Send + Sync {}
 
 impl<T: Send + Sync> Message for T {}
 
-type BoxedMessage = Box<Any + Send + Sync>;
-type BoxedCallback = Box<Any + Send>;
+type BoxedMessage = Box<dyn Any + Send + Sync>;
+type BoxedCallback = Box<dyn Any + Send>;
 
 #[derive(Debug)]
 enum SubscriberTask {
@@ -104,7 +104,7 @@ enum SubscriberTask {
 }
 
 struct Worker {
-    worker: Box<Fn(&BoxedCallback, Arc<BoxedMessage>) + Send + Sync>,
+    worker: Box<dyn Fn(&BoxedCallback, Arc<BoxedMessage>) + Send + Sync>,
 }
 
 impl Debug for Worker {
@@ -133,7 +133,7 @@ impl Worker {
 }
 
 struct Callback<M: Message> {
-    callback: Box<Fn(&M) -> () + Send>,
+    callback: Box<dyn Fn(&M) -> () + Send>,
 }
 
 impl<M: Message> Callback<M> {
